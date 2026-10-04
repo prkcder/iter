@@ -27,6 +27,12 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
+
+# Query customers on one plan who viewed Pricing or Settings in the last 7 days,
+# keeping only each customer's latest qualifying page view.
+
+# distinct on (c.id) keeps one row per customer; ordering by event_time desc
+# makes that row the customer's newest qualifying page view.
 QUERY = """
 select distinct on (c.id)
     c.id as customer_id, c.email, c.first_name, c.last_name, c.plan_type, c.candidate,
@@ -39,17 +45,18 @@ where c.plan_type = 'enterprise'
 order by c.id, pv.event_time desc;
 """
 
-connection = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-print("Connected to the database")
+def fetch_rows():
+    """Run the query and return each row as a dictionary."""
+    # The connection closes as soon as the query finishes,
+    # so it isn't held open while we wait on Iterable.
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as connection:
+        rows = connection.execute(QUERY).fetchall()
+    return rows
 
-cursor = connection.cursor()
-cursor.execute(QUERY)
 
-rows = cursor.fetchall()
-print(f"Found {len(rows)} customers")
-
-for row in rows:
-    user_payload = {
+def build_user_payload(row):
+    """Profile fields for Iterable's users/update."""
+    return {
         "email": row["email"],
         "userId": str(row["customer_id"]),
         "dataFields": {
@@ -61,29 +68,77 @@ for row in rows:
         },
     }
 
-    event_payload = {
+
+def build_event_payload(row):
+    """page_view event for Iterable's events/track."""
+    return {
         "email": row["email"],
         "userId": str(row["customer_id"]),
         "eventName": "page_view",
+        # Reusing the page view id means re-running the script
+        # updates the same event instead of creating a duplicate.
         "id": str(row["page_view_id"]),
+        # When the view actually happened (Unix seconds), not when the script ran
         "createdAt": int(row["event_time"].timestamp()),
         "dataFields": {
             "page": row["page"],
             "device": row["device"],
             "browser": row["browser"],
             "location": row["location"],
+            # Iterable's date format: yyyy-MM-dd HH:mm:ss
             "timestamp": row["event_time"].strftime("%Y-%m-%d %H:%M:%S"),
             "candidate": row["candidate"],
         },
     }
 
-    user_response = requests.post(f"{ITERABLE_BASE_URL}/users/update", json=user_payload, headers=HEADERS)
-    print(row["email"], "users/update", user_response.status_code, user_response.text)
 
-    event_response = requests.post(f"{ITERABLE_BASE_URL}/events/track", json=event_payload, headers=HEADERS)
-    print(row["email"], "events/track", event_response.status_code, event_response.text)
+def send_to_iterable(endpoint, payload, email):
+    """POST a payload to Iterable, log the result, and return True on success."""
+    url = f"{ITERABLE_BASE_URL}/{endpoint}"
+ 
+    try:
+        # timeout so the script never hangs if Iterable doesn't respond
+        response = requests.post(url, json=payload, headers=HEADERS, timeout=10)
+    except requests.RequestException as error:
+        logger.error(f"{email} {endpoint} network error: {error}")
+        return False
+ 
+    if response.ok:
+        logger.info(f"{email} {endpoint} {response.status_code} {response.text}")
+        return True
+ 
+    if 400 <= response.status_code < 500:
+        # Our request was wrong (bad key, bad field type, etc.)
+        logger.error(f"{email} {endpoint} client error {response.status_code}: {response.text}")
+    else:
+        # Problem on Iterable's side
+        logger.error(f"{email} {endpoint} server error {response.status_code}: {response.text}")
+    return False
+ 
+ 
+def main():
+    # Fail early with a clear message instead of a confusing 401
+    if not DATABASE_URL or not ITERABLE_API_KEY:
+        logger.error("Missing DATABASE_URL or ITERABLE_API_KEY in .env")
+        return
+ 
+    try:
+        rows = fetch_rows()
+    except psycopg.Error as error:
+        logger.error(f"Database error: {error}")
+        return
+ 
+    logger.info(f"Found {len(rows)} customers")
+ 
+    # One failed call doesn't stop the run; the summary shows the totals
+    results = []
+    for row in rows:
+        results.append(send_to_iterable("users/update", build_user_payload(row), row["email"]))
+        results.append(send_to_iterable("events/track", build_event_payload(row), row["email"]))
+ 
+    logger.info(f"Done: {results.count(True)} succeeded, {results.count(False)} failed")
+ 
 
-
-connection.close()
-
-
+if __name__ == "__main__":
+    main()
+    
